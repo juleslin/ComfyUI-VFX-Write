@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 from aiohttp import web
@@ -6,8 +7,10 @@ from server import PromptServer
 
 from .nodes import (
     full_image_png,
+    group_files,
     is_web_displayable_image,
     list_frames,
+    list_frames_in_folder,
     list_versions,
     make_thumbnail_png,
     movie_info,
@@ -15,6 +18,30 @@ from .nodes import (
 
 
 routes = PromptServer.instance.routes
+
+
+# group_files' regex matching over every file in a large folder is real
+# CPU work — offloading it keeps aiohttp's single-threaded event loop free
+# for other requests while a big destination folder is being browsed, same
+# reasoning as ComfyUI-VFX-Read's own /vfx-read/list route.
+async def run_in_executor(fn, *args):
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, fn, *args)
+
+
+def _list_folder_sync(folder):
+    directories = sorted(
+        (
+            {"name": item.name, "path": str(item)}
+            for item in folder.iterdir()
+            if item.is_dir()
+        ),
+        key=lambda item: item["name"].lower(),
+    )
+
+    files = group_files(folder)
+
+    return directories, files
 
 
 @routes.get("/vfx-write/browse")
@@ -32,19 +59,7 @@ async def browse(request):
     else:
         folder = Path.home()
 
-    directories = sorted(
-        (
-            {"name": item.name, "path": str(item)}
-            for item in folder.iterdir()
-            if item.is_dir()
-        ),
-        key=lambda item: item["name"].lower(),
-    )
-
-    files = sorted(
-        (item.name for item in folder.iterdir() if item.is_file()),
-        key=str.lower,
-    )
+    directories, files = await run_in_executor(_list_folder_sync, folder)
 
     return web.json_response(
         {
@@ -66,11 +81,24 @@ async def versions(request):
     pattern = raw_pattern.replace("\\", "/")
 
     try:
-        found = list_versions(pattern)
+        found = await run_in_executor(list_versions, pattern)
     except ValueError as error:
         return web.json_response({"versions": [], "error": str(error)})
 
     return web.json_response({"versions": found})
+
+
+@routes.get("/vfx-write/frames-in-folder")
+async def frames_in_folder(request):
+    raw_pattern = request.query.get("path", "").strip()
+
+    if not raw_pattern:
+        return web.json_response({"frames": []})
+
+    pattern = raw_pattern.replace("\\", "/")
+    found = await run_in_executor(list_frames_in_folder, pattern)
+
+    return web.json_response({"frames": found})
 
 
 @routes.get("/vfx-write/frames")
@@ -89,7 +117,7 @@ async def frames(request):
     pattern = raw_pattern.replace("\\", "/")
 
     try:
-        found = list_frames(pattern, version)
+        found = await run_in_executor(list_frames, pattern, version)
     except ValueError as error:
         return web.json_response({"frames": [], "error": str(error)})
 
@@ -126,7 +154,7 @@ async def video_info(request):
         raise web.HTTPNotFound(text=f"File does not exist:\n{source}")
 
     try:
-        info = movie_info(source)
+        info = await run_in_executor(movie_info, source)
     except Exception as error:
         raise web.HTTPInternalServerError(text=str(error))
 
@@ -150,7 +178,7 @@ async def image(request):
         return web.FileResponse(source)
 
     try:
-        png_bytes = full_image_png(source)
+        png_bytes = await run_in_executor(full_image_png, source)
     except Exception as error:
         raise web.HTTPInternalServerError(text=str(error))
 
@@ -165,7 +193,7 @@ async def thumbnail(request):
         raise web.HTTPBadRequest(text="Missing 'path' query parameter.")
 
     try:
-        png_bytes = make_thumbnail_png(raw_path)
+        png_bytes = await run_in_executor(make_thumbnail_png, raw_path)
     except ValueError as error:
         raise web.HTTPNotFound(text=str(error))
     except Exception as error:

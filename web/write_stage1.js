@@ -2,116 +2,86 @@
 //
 // Node type: VFXWrite   Extension: vfx.write.stage1
 // Routes:    /vfx-write/browse  /vfx-write/versions  /vfx-write/frames
-//            /vfx-write/thumbnail  /vfx-write/video
+//            /vfx-write/frames-in-folder  /vfx-write/thumbnail  /vfx-write/video
+//            /vfx-write/video-info  /vfx-write/image
 //
-// Layout: Choose destination -> path -> frame_start (hidden) -> Preview
-// version -> frame -> first -> last -> preview (a single widget: canvas +
-// play/loop/fullscreen drawn as an overlay bar at its own bottom edge, not
-// a separate widget — see the design note below for why). Controls on
-// top, big preview filling the bottom — same shape as core nodes like
-// Load Image — and preview is the LAST widget so nothing else can ever
-// sit where it might overdraw.
+// Layout: one file row (destination text + folder icon) -> one version row
+// (dropdown, no label) -> preview (image or video) -> scrub bar -> a
+// unified transport row (play/prev/next/loop/fullscreen). Direct port of
+// ComfyUI-VFX-Read's own round-3 layout — see that file's header for the
+// full design history this one reuses.
 //
 // ---------------------------------------------------------------------------
 // Preview sizing design (read this before touching computeSize/draw)
 // ---------------------------------------------------------------------------
 // computeSize() returns a small, TRULY FIXED minimum (PREVIEW_MIN_H) —
-// never anything derived from node.size. draw() is what actually fills
-// the live node.size, reading it fresh on every call.
-//
-// Four earlier, broken designs, kept here so the next change doesn't
-// repeat them:
-//   1. computeSize() returning a STORED value that draw() had derived from
-//      node.size the frame before: LiteGraph clamps resize-drag results UP
-//      to computeSize() as a floor. Since that floor reflected the
-//      PREVIOUS frame's size, any mismatch with the real chrome height
-//      compounded every redraw — the node grew on its own, detached from
-//      the mouse.
-//   2. computeSize() returning a fixed constant while draw() still filled
-//      node.size dynamically, with preview and transport as TWO SEPARATE
-//      widgets: stopped the runaway growth, but LiteGraph positions each
-//      widget using the PRECEDING widget's computeSize(), not what it
-//      actually drew — so transport (positioned right after preview)
-//      stayed pinned wherever preview's fixed computeSize placed it,
-//      never tracking preview's real drawn bottom edge as the node
-//      resized.
-//   3. computeSize() reading node.size live but updating its OWN cached
-//      "chrome" from node.onResize(): the cached chrome could still go
-//      stale mid-drag (onResize does not fire at every moment LiteGraph
-//      itself consults computeSize()), reintroducing the same compounding
-//      growth as #1.
-//   4. computeSize() reading node.size live directly (no separate cache):
-//      fixed growth AND transport-tracking (there's no transport widget
-//      once merged into preview — see below), but broke SHRINKING. Since
-//      computeSize()'s return scaled with the CURRENT size, it amounted
-//      to "my minimum is my current size" — self-referential, so
-//      LiteGraph's own "never go below computeSize()" rule blocked any
-//      shrink attempt by definition, no matter how small a shrink.
-// The fix: a computeSize() that is a genuine constant is the only design
-// that can never conflict with a drag in either direction. It sacrifices
-// nothing, because the ACTUAL dynamic "fill available space" look comes
-// entirely from draw() reading node.size live — draw() never feeds back
-// into LiteGraph's size bookkeeping the way computeSize() does.
-//
-// Merging transport into preview (one widget, not two) removes the
-// remaining reason a second widget's position needed to track anything:
-// there is no widget "after" preview whose position depends on preview's
-// reported height, so preview can freely draw its play/loop/fullscreen
-// bar whereever it likes within its own live-sized box.
+// never anything derived from node.size. draw() (for the native preview;
+// here everything is DOM so there's no draw() at all) or the DOM wrapper's
+// own CSS is what actually fills the live node.size. See ComfyUI-VFX-Read's
+// header for the four earlier, broken designs this avoids — same node type,
+// same bug class, already solved once; not repeating that history here.
 //
 // ---------------------------------------------------------------------------
 // Value persistence design (read this before changing onConfigure)
 // ---------------------------------------------------------------------------
-// "Choose destination" is added before the native "path"/"frame_start"
-// widgets, which reorders them relative to their LiteGraph creation order.
-// LiteGraph serializes widget values POSITIONALLY into widgets_values[], so
-// permuting node.widgets breaks save/restore unless handled explicitly
-// (ComfyUI-VFX-Read hit this first — see its own read_stage1.js header).
-// Fix, ported from Read: onSerialize writes a NAME-KEYED map into
-// o.vfx_write_values; onConfigure restores from that map after
-// reorderWidgets() has run, instead of relying on positional restore.
+// LiteGraph serializes widget values POSITIONALLY into widgets_values[].
+// reorderWidgets() permutes node.widgets in place, so the save-time array
+// and the load-time array disagree and values land in the wrong slots. Fix:
+// onSerialize writes a NAME-KEYED map into o.vfx_write_values, and
+// onConfigure restores from that map after reorderWidgets() has run — same
+// fix ComfyUI-VFX-Read uses.
 //
-// frame / first / last are preview-only (not Python inputs at all — they
-// never affect what gets written) and are always re-derived from the
-// selected version's real frame range, so they are marked serialize:false
-// rather than persisted.
+// `path`/`file_name`/`frame_start` are real Python inputs (write() needs
+// all three — VFXWrite has no outputs at all, it's a pure terminal/side-
+// effect node), so — like Read's source_path/frame/first/last/etc. — each
+// becomes an invisible DOM-backed carrier of the same name
+// (buildHiddenValue/replaceWithHiddenCarrier) rather than a visible native
+// row. `path`/`file_name` are driven by the single visible file-row text
+// field (split on the last '/'); `frame_start` has no visible control at
+// all — it just keeps its INPUT_TYPES default (1001) unless restored from
+// a saved workflow. Confirmed via app.graphToPrompt() on Read:
+// addDOMWidget's getValue/setValue IS what prompt-queuing reads through
+// (keyed by name, same as a native widget), so this is safe for real
+// execution parameters, not just decorative UI.
+//
+// `first`/`last` (the browsed version's on-disk frame range) are NOT Python
+// inputs at all — purely local scrub-bar bookkeeping — so they're plain
+// fields on the preview state object, not widgets. This also means the old
+// frame/first/last "watcher" machinery (watchWidgetValue) is gone entirely
+// — nothing in the UI writes into a real Python input at all; playback
+// here is preview-only.
 
 import { app } from "../../scripts/app.js";
 
 const NODE_TYPE = "VFXWrite";
+
 const PREVIEW_WIDGET = "$$vfx-write-preview";
 const VIDEO_WIDGET = "$$vfx-write-video";
-const FULLSCREEN_ROW_WIDGET = "$$vfx-write-fullscreen-row";
-const VERSION_WIDGET = "$$vfx-write-version";
-const BROWSE_WIDGET = "Choose destination";
-const FRAME_WIDGET = "frame";
-const FIRST_WIDGET = "first";
-const LAST_WIDGET = "last";
+const SCRUB_WIDGET = "$$vfx-write-scrub";
+const TRANSPORT_WIDGET = "vfx_write_transport";
+const FILE_ROW_WIDGET = "$$vfx-write-file-row";
+const VERSION_ROW_WIDGET = "$$vfx-write-version-row";
 
-// "frame" is a REAL Python input now (the write() function uses it to
-// extract a frame back out of a written video), so it needs the same
-// name-keyed persistence protection as path/file_name/frame_start.
-// first/last stay UI-only (serialize:false) — informational range display,
-// not something write() reads.
-const VALUE_WIDGETS = ["path", "file_name", "frame_start", FRAME_WIDGET];
+// Real Python inputs (write() reads all three) — see the design note above.
+const VALUE_WIDGETS = ["path", "file_name", "frame_start"];
 
 const WIDGET_ORDER = [
-  BROWSE_WIDGET,
-  "path",
-  "file_name",
-  "frame_start",
-  VERSION_WIDGET,
-  FRAME_WIDGET,
-  FIRST_WIDGET,
-  LAST_WIDGET,
-  FULLSCREEN_ROW_WIDGET,
+  FILE_ROW_WIDGET,
+  VERSION_ROW_WIDGET,
   PREVIEW_WIDGET,
   VIDEO_WIDGET,
+  SCRUB_WIDGET,
+  TRANSPORT_WIDGET,
 ];
 
 const PREVIEW_MIN_H = 120;
 const PREVIEW_DEFAULT_H = 220;
 const TRANSPORT_H = 24;
+const SCRUB_H = 20;
+// Wide enough for the file row's text field + folder icon, and the
+// transport row's five buttons, without crowding. Retune directly if it
+// doesn't match your own resized node.
+const MIN_NODE_W = 320;
 
 const MOVIE_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"]);
 
@@ -121,6 +91,10 @@ const MAX_CONCURRENT = 4;
 const MAX_CACHE = 240;
 const DEFAULT_FPS = 24;
 
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
 function el(tag, style, props) {
   const node = document.createElement(tag);
   if (style) Object.assign(node.style, style);
@@ -128,20 +102,115 @@ function el(tag, style, props) {
   return node;
 }
 
+// Shared small dark-themed icon/label button — same styling used
+// throughout this file's dialogs and rows.
+function smallBtn(label, title) {
+  return el(
+    "button",
+    {
+      background: "#2c2c2c",
+      color: "#ddd",
+      border: "1px solid #4a4a4a",
+      borderRadius: "3px",
+      padding: "3px 8px",
+      font: "11px sans-serif",
+      cursor: "pointer",
+      minWidth: "28px",
+    },
+    { textContent: label, title: title || "" }
+  );
+}
+
+function rowTextInput(type) {
+  return el(
+    "input",
+    {
+      flex: "1 1 auto",
+      minWidth: "0",
+      background: "#1a1a1a",
+      border: "1px solid #444",
+      color: "#ddd",
+      padding: "4px 6px",
+      borderRadius: "3px",
+      font: "11px monospace",
+    },
+    { type: type || "text" }
+  );
+}
+
+function rowSelect(options) {
+  const s = el("select", {
+    width: "100%",
+    background: "#1a1a1a",
+    border: "1px solid #444",
+    color: "#ddd",
+    padding: "4px 6px",
+    borderRadius: "3px",
+    font: "11px sans-serif",
+  });
+  for (const opt of options) {
+    const o = document.createElement("option");
+    o.value = opt;
+    o.textContent = opt;
+    s.appendChild(o);
+  }
+  return s;
+}
+
+function pairedRowContainer() {
+  return el("div", {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  });
+}
+
+// Grey outline-folder SVG (currentColor) instead of an emoji — an emoji
+// glyph carries its own fixed color that can't be recolored via CSS; an
+// inline SVG can.
+function folderIconButton() {
+  const btn = el(
+    "button",
+    {
+      background: "#2c2c2c",
+      border: "1px solid #4a4a4a",
+      borderRadius: "3px",
+      padding: "0 8px",
+      cursor: "pointer",
+      color: "#9a9a9a",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    { title: "Choose destination" }
+  );
+  btn.innerHTML =
+    '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">' +
+    '<path d="M10 4H2v16h20V6H12l-2-2z"/></svg>';
+  return btn;
+}
+
+// Commits a text field's value on Enter or on losing focus, rather than on
+// every keystroke.
+function commitOnEnterOrBlur(input, commit) {
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      commit();
+      input.blur();
+    }
+  });
+  input.addEventListener("blur", commit);
+}
+
 function getWidget(node, name) {
   return node.widgets?.find((w) => w.name === name) || null;
 }
 
-// Node 2.0 renders each widget's visible DOM control (text/number/combo
-// input) from a separate Vue-reactive mirror on widget._state, NOT from
-// widget.value directly — confirmed live this session against ComfyUI-VFX-
-// Read's identical bug (widget.value correctly held a restored value after
-// reload, but the actual on-screen input showed empty, because nothing had
-// ever written to _state.value). Writing widget._state.value directly does
-// trigger Vue's reactivity and fixes the display; classic-mode widgets (no
-// _state) are unaffected by the extra check. Every programmatic
-// widget-value write in this file should go through this function rather
-// than assigning widget.value directly, or the same bug recurs.
+// Node 2.0 renders each widget's visible DOM control from a separate
+// Vue-reactive mirror on widget._state, NOT from widget.value directly —
+// see ComfyUI-VFX-Read's identical note. Every programmatic widget-value
+// write in this file goes through this function.
 function setWidget(node, name, value) {
   const w = getWidget(node, name);
   if (!w) return;
@@ -151,7 +220,7 @@ function setWidget(node, name, value) {
 
 // Mirrors nodes.py's combine_path(): join the folder ("path") and the
 // filename pattern ("file_name") into the one combined pattern string the
-// backend routes (versions/frames/thumbnail/video-info) all still expect.
+// backend routes (versions/frames/thumbnail/video/video-info) all expect.
 function patternOf(node) {
   const folder = (getWidget(node, "path")?.value || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
   const name = (getWidget(node, "file_name")?.value || "").trim().replace(/\\/g, "/");
@@ -159,10 +228,34 @@ function patternOf(node) {
   return `${folder}/${name}`;
 }
 
-function numValue(node, name, fallback) {
-  const v = getWidget(node, name)?.value;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : fallback;
+// The single combined string the file row shows: folder + "/" + filename.
+function combinedDisplayValue(node) {
+  const path = getWidget(node, "path")?.value || "";
+  const fileName = getWidget(node, "file_name")?.value || "";
+  if (!path && !fileName) return "";
+  const folder = path.replace(/\\/g, "/").replace(/\/+$/, "");
+  return folder ? `${folder}/${fileName}` : fileName;
+}
+
+// Splits a typed/pasted combined string back into path + file_name on the
+// last '/' — same split a save dialog would do. Everything before it is
+// the destination folder, the remainder is the filename pattern (with its
+// own v##/#### tokens).
+function applyCombinedInput(node, raw) {
+  const value = (raw || "").trim().replace(/\\/g, "/");
+  const idx = value.lastIndexOf("/");
+  const folder = idx >= 0 ? value.slice(0, idx) : "";
+  const name = idx >= 0 ? value.slice(idx + 1) : value;
+  setWidget(node, "path", folder);
+  setWidget(node, "file_name", name);
+  refreshVersionList(node);
+}
+
+function refreshFileRowDisplay(node) {
+  const state = node.__vfxWritePreview;
+  if (!state?.fileRowInput) return;
+  const v = combinedDisplayValue(node);
+  if (state.fileRowInput.value !== v) state.fileRowInput.value = v;
 }
 
 async function apiGet(path, params) {
@@ -197,6 +290,28 @@ function videoUrl(sourcePath) {
   return url.toString();
 }
 
+function fullImageUrl(sourcePath) {
+  const url = new URL("/vfx-write/image", window.location.origin);
+  url.searchParams.set("path", sourcePath || "");
+  return url.toString();
+}
+
+// Chrome's <video> element (MEDIA_ERR_SRC_NOT_SUPPORTED, code 4) refuses
+// to decode several codecs common in VFX delivery — ProRes and DNxHD
+// chief among them — no matter the container extension. Confirmed live:
+// a real ProRes .mov fails with the browser's own cryptic
+// "PipelineStatus::DEMUXER_ERROR_NO_SUPPORTED_STREAMS" message, which
+// reads like something is broken when the file (and the write/read paths
+// themselves) are actually fine — only the in-node preview can't decode
+// it. This is a genuine browser limitation with no workaround; the
+// clearer message just says so instead of surfacing raw internals.
+function friendlyVideoError(error) {
+  if (error && error.code === MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED) {
+    return "Preview unavailable: this video's codec isn't supported by browser playback (common for ProRes/DNxHD .mov files). The file itself is fine — just not previewable here.";
+  }
+  return error?.message || "Failed to load video.";
+}
+
 function isMovie(path) {
   const dot = (path || "").lastIndexOf(".");
   if (dot < 0) return false;
@@ -205,17 +320,8 @@ function isMovie(path) {
 
 // Chrome = everything on the node that ISN'T the preview (title,
 // input/output sockets, every other widget) — a fixed quantity for this
-// node type, measured exactly once and cached on the node instance.
-//
-// Rather than reimplementing LiteGraph's own layout math by hand (tried
-// that — it undercounted by ~48px, most likely missing how it reserves
-// space for this node's input/output sockets), this asks LiteGraph
-// itself: the preview widget's own computeSize() (below) is a genuine
-// constant (PREVIEW_MIN_H), so node.computeSize()'s total is always
-// exactly chrome + PREVIEW_MIN_H — subtracting PREVIEW_MIN_H isolates
-// chrome, with no dependency on node.size anywhere in the measurement.
-// Verified live that node.computeSize() does not mutate node.size, so
-// this is a safe, pure read.
+// node type, measured exactly once and cached on the node instance. See
+// ComfyUI-VFX-Read's chromeOf for the full design note.
 function chromeOf(node) {
   if (node.__vfxWriteChrome !== undefined) return node.__vfxWriteChrome;
   node.__vfxWriteChrome = node.computeSize()[1] - PREVIEW_MIN_H;
@@ -240,13 +346,11 @@ function sanitizeValues(saved) {
   const path = src.path;
   const fileName = src.file_name;
   const frameStart = Number(src.frame_start);
-  const frame = Number(src[FRAME_WIDGET]);
 
   return {
     path: typeof path === "string" ? path : "",
     file_name: typeof fileName === "string" ? fileName : "",
     frame_start: Number.isFinite(frameStart) ? frameStart : 1001,
-    [FRAME_WIDGET]: Number.isFinite(frame) ? frame : 1,
   };
 }
 
@@ -258,20 +362,43 @@ function applyValues(node, values) {
   return clean;
 }
 
-// Hidden, not removed: the value (default 1001) still exists and still
-// controls where a new sequence's numbering starts — it's just not shown,
-// per request. Same technique ComfyUI-VFX-Read uses for its range widgets.
-function hideWidget(node, name) {
-  const w = getWidget(node, name);
-  if (!w) return;
-  w.hidden = true;
-  w.computeSize = () => [0, -4];
+// ---------------------------------------------------------------------------
+// hidden value carriers (see design note near buildHiddenValue in
+// ComfyUI-VFX-Read for why `widget.hidden = true` does NOT work on this
+// ComfyUI build, and why `options.hidden` on a DOM widget does)
+// ---------------------------------------------------------------------------
+
+function buildHiddenValue(node, name, initialValue) {
+  let backing = initialValue;
+  const container = el("div", { display: "none" });
+  const widget = node.addDOMWidget(name, "hidden", container, {
+    getValue: () => backing,
+    setValue: (v) => { backing = v; },
+    hidden: true,
+  });
+  widget.computeSize = () => [0, 0];
+  return widget;
+}
+
+// Removes the native widget ComfyUI auto-created from INPUT_TYPES for
+// `name` and replaces it with an invisible carrier of the same name,
+// seeded with whatever value it currently held. Runs in onNodeCreated,
+// which always fires before onConfigure's own restore — so this seeds
+// from the INPUT_TYPES default on a fresh node, and onConfigure's later
+// setWidget() call finds this carrier by name and applies the real
+// restored value to it exactly as it would a native widget.
+function replaceWithHiddenCarrier(node, name) {
+  const existing = getWidget(node, name);
+  const initialValue = existing ? existing.value : undefined;
+  if (existing) {
+    const idx = node.widgets.indexOf(existing);
+    if (idx !== -1) node.widgets.splice(idx, 1);
+  }
+  return buildHiddenValue(node, name, initialValue);
 }
 
 function reorderWidgets(node) {
   if (!Array.isArray(node.widgets) || !node.widgets.length) return;
-
-  hideWidget(node, "frame_start");
 
   const rank = (w) => {
     const i = WIDGET_ORDER.indexOf(w?.name);
@@ -289,43 +416,8 @@ function reorderWidgets(node) {
   node.setDirtyCanvas?.(true, true);
 }
 
-function watchWidgetValue(widget, onChange) {
-  if (!widget || widget.__vfxWatched) return;
-
-  const existing = Object.getOwnPropertyDescriptor(widget, "value");
-  let backing = existing && "value" in existing ? existing.value : widget.value;
-
-  const get = existing && existing.get ? existing.get.bind(widget) : () => backing;
-  const set =
-    existing && existing.set
-      ? existing.set.bind(widget)
-      : (v) => {
-          backing = v;
-        };
-
-  Object.defineProperty(widget, "value", {
-    configurable: true,
-    enumerable: true,
-    get,
-    set(v) {
-      const before = get();
-      set(v);
-      if (before !== get()) {
-        try {
-          onChange(get());
-        } catch (e) {
-          console.error(e);
-        }
-      }
-    },
-  });
-
-  widget.__vfxWatched = true;
-}
-
 // ---------------------------------------------------------------------------
-// frame cache — keyed by frame number (or 0 for a single-file "sequence"),
-// mirrors ComfyUI-VFX-Read's prefetch approach.
+// frame cache — keyed by frame number (or 0 for a single-file "sequence").
 // ---------------------------------------------------------------------------
 
 function createFrameCache() {
@@ -383,33 +475,152 @@ function cacheClear(cache) {
 }
 
 // ---------------------------------------------------------------------------
-// preview - a DOM widget (real <img>). Always the LAST widget before the
-// video widget. Renders either a preloaded image (for a written image /
-// image sequence) or is collapsed to zero height while buildVideoWidget's
-// <video> is showing instead — see the "mode" field on state.
+// file row — combined destination text field + folder icon
 // ---------------------------------------------------------------------------
 
-// Node 2.0 gives a canvas type:"custom" widget a HARD grid cell matching
-// exactly what its computeSize() reports — confirmed live this session by
-// inspecting the real DOM: our preview widget's row was exactly
-// PREVIEW_MIN_H (120px) tall, no more, with the NEXT widget's own
-// (opaque-background) row starting immediately after it. Classic LiteGraph
-// let a widget's draw() call paint taller than its own declared box
-// harmlessly (nothing clipped it); Node 2.0's real CSS grid does NOT allow
-// that — content painted below the 120px cell is simply covered by the
-// next row's own opaque background, which is exactly the "part of the
-// canvas is cropped" bug reported live. A DOM widget doesn't have this
-// problem at all: its wrapper element visibly stretches to fill whatever
-// space is actually available (confirmed for the video widget below), so
-// this is now a real <img>, not a canvas draw() — same fix, same
-// architecture, as the video widget already uses.
+function buildFileRow(node) {
+  const state = node.__vfxWritePreview;
+  const container = pairedRowContainer();
+  container.style.marginTop = "6px";
+
+  const input = rowTextInput("text");
+  input.placeholder = "Choose a destination...";
+  input.value = combinedDisplayValue(node);
+  commitOnEnterOrBlur(input, () => {
+    applyCombinedInput(node, input.value);
+    refreshFileRowDisplay(node);
+  });
+
+  const browseBtn = folderIconButton();
+  browseBtn.addEventListener("click", () => buildBrowseDialog(node));
+
+  container.appendChild(input);
+  container.appendChild(browseBtn);
+
+  const widget = node.addDOMWidget(FILE_ROW_WIDGET, "file-row", container, {
+    serialize: false,
+  });
+  widget.computeSize = (width) => [width, TRANSPORT_H];
+
+  state.fileRowInput = input;
+  return widget;
+}
+
+// ---------------------------------------------------------------------------
+// version row — dropdown only, no label
+// ---------------------------------------------------------------------------
+
+function setVersionSelectOptions(selectEl, labels) {
+  selectEl.replaceChildren();
+  for (const label of labels) {
+    const o = document.createElement("option");
+    o.value = label;
+    o.textContent = label;
+    selectEl.appendChild(o);
+  }
+}
+
+function setVersionRowVisible(node, visible) {
+  const state = node.__vfxWritePreview;
+  if (!state || state.versionRowVisible === visible) return;
+  state.versionRowVisible = visible;
+  if (state.versionRowContainer) {
+    state.versionRowContainer.style.display = visible ? "flex" : "none";
+  }
+  node.setDirtyCanvas?.(true, true);
+}
+
+function buildVersionRow(node) {
+  const state = node.__vfxWritePreview;
+  const container = pairedRowContainer();
+  container.style.marginBottom = "8px";
+  // Hidden until refreshVersionList finds at least one version — a file
+  // with no version token anywhere (filename or destination folder) has
+  // nothing to pick between, so there's no point showing an empty
+  // dropdown. computeSize alone does NOT collapse a DOM widget's wrapper
+  // under Node 2.0 (same "computeSize is ignored for hiding" behavior
+  // documented throughout this project), so display is toggled directly
+  // too — see refreshVersionList.
+  container.style.display = "none";
+
+  const versionSelect = rowSelect([]);
+  versionSelect.title = "Version";
+  // A bare <select> inside a flex row sizes to its OPTIONS' own text
+  // content (e.g. "v01") under flex-basis:auto, not the container —
+  // confirmed live: it left-aligned and sat at roughly a third of the row
+  // width. flex:"1 1 auto" forces it to fill the row regardless of option
+  // text length.
+  versionSelect.style.flex = "1 1 auto";
+  versionSelect.addEventListener("change", () => {
+    const versions = node.__vfxWriteVersions || [];
+    const match = versions.find(
+      (v) => `v${String(v.version).padStart(2, "0")}` === versionSelect.value
+    );
+    if (match) loadVersion(node, patternOf(node), match.version);
+  });
+
+  container.appendChild(versionSelect);
+
+  const widget = node.addDOMWidget(VERSION_ROW_WIDGET, "version-row", container, {
+    serialize: false,
+  });
+  widget.computeSize = (width) => [width, state.versionRowVisible ? TRANSPORT_H : 0];
+
+  state.versionSelect = versionSelect;
+  state.versionRowContainer = container;
+  state.versionRowVisible = false;
+  return widget;
+}
+
+async function refreshVersionList(node) {
+  const state = node.__vfxWritePreview;
+  const versionSelect = state?.versionSelect;
+  if (!versionSelect) return;
+
+  const pattern = patternOf(node);
+
+  if (!pattern) {
+    setVersionSelectOptions(versionSelect, []);
+    setVersionRowVisible(node, false);
+    return;
+  }
+
+  let data;
+  try {
+    data = await apiGet("/vfx-write/versions", { path: pattern });
+  } catch (_) {
+    return;
+  }
+
+  const versions = data.versions || [];
+  node.__vfxWriteVersions = versions;
+  setVersionRowVisible(node, versions.length > 0);
+
+  const labels = versions.map((v) => `v${String(v.version).padStart(2, "0")}`);
+  setVersionSelectOptions(versionSelect, labels);
+
+  if (labels.length) {
+    versionSelect.value = labels[labels.length - 1];
+    const latest = versions[versions.length - 1];
+    loadVersion(node, pattern, latest.version);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// preview - a DOM widget (real <img>). Always before the video widget.
+// ---------------------------------------------------------------------------
+
 function buildPreviewWidget(node) {
   const state = {
     mode: "image", // "image" | "video" — video uses buildVideoWidget's
-    // <video> element instead. This widget's DOM wrapper collapses to
-    // zero height in video mode; see reorderWidgets/buildVideoWidget for
-    // how the two trade off which one is actually visible.
+    // <video> element instead; this widget's DOM wrapper collapses to
+    // zero height while that's active.
+    playhead: 1, // currently browsed/scrubbed frame number
+    first: 1,
+    last: 1,
+    scrubVisible: false,
     img: null,
+    shownPath: null,
     videoEl: null,
     filename: "",
     frameList: [],
@@ -417,7 +628,7 @@ function buildPreviewWidget(node) {
     cache: createFrameCache(),
     playing: false,
     loop: false,
-    rafId: 0, // image-sequence play loop
+    rafId: 0,
     lastTick: 0,
     acc: 0,
   };
@@ -487,12 +698,9 @@ function buildPreviewWidget(node) {
   return widget;
 }
 
-// Resets the image side of the preview to "nothing loaded". Used whenever
-// switching away from a shown frame (new version, video mode, empty
-// sequence) — keeps the DOM in sync with state without duplicating the
-// show/hide logic at every call site.
 function clearImageDisplay(state) {
   state.img = null;
+  state.shownPath = null;
   state.filename = "";
   if (state.imgEl) {
     state.imgEl.removeAttribute("src");
@@ -503,20 +711,7 @@ function clearImageDisplay(state) {
 }
 
 // ---------------------------------------------------------------------------
-// video - a real, persistent <video controls loop> element (a DOM widget,
-// not a canvas), used instead of PREVIEW_WIDGET when state.mode is
-// "video". Real playback, scrub bar, volume, and fullscreen all come for
-// free from the browser — no custom drawing, no custom hit-testing, no
-// custom fullscreen handling to get wrong. Built once and reused for the
-// node's lifetime; setupVideo/teardownVideo just show/hide it and change
-// its src.
-//
-// computeSize() is a genuine constant here too, for the exact same reason
-// as PREVIEW_WIDGET's (see the design note near the top of this file) —
-// the two widgets' computeSize()s are simple opposites of each other
-// (whichever matches the current state.mode reports PREVIEW_MIN_H, the
-// other reports 0), so they never both claim space, and neither depends
-// on node.size, so neither can create a resize feedback loop.
+// video - a real, persistent <video controls loop> element.
 // ---------------------------------------------------------------------------
 
 function buildVideoWidget(node) {
@@ -528,6 +723,7 @@ function buildVideoWidget(node) {
     background: "#000",
     borderRadius: "4px",
     overflow: "hidden",
+    position: "relative",
     display: "none",
   });
 
@@ -542,62 +738,115 @@ function buildVideoWidget(node) {
     background: "#000",
   });
 
+  // A video with no loading feedback of its own can look frozen for
+  // several seconds on a large or slow-to-reach file (e.g. a network
+  // drive) — reported live as "choosing a movie has no response", when
+  // it was actually just buffering with nothing on screen to say so.
+  // Mirrors the image preview's own "Loading preview..." placeholder.
+  const status = el(
+    "div",
+    {
+      position: "absolute",
+      inset: "0",
+      display: "none",
+      alignItems: "center",
+      justifyContent: "center",
+      color: "#aaa",
+      font: "11px sans-serif",
+      background: "rgba(0,0,0,0.4)",
+      pointerEvents: "none",
+      textAlign: "center",
+      padding: "8px",
+    },
+    { textContent: "Loading video..." }
+  );
+
   container.appendChild(videoEl);
+  container.appendChild(status);
 
   const widget = node.addDOMWidget(VIDEO_WIDGET, "video", container, {
     serialize: false,
   });
   widget.computeSize = (width) => [width, state.mode === "video" ? PREVIEW_MIN_H : 0];
 
+  // Native controls stay on for fast drag-to-seek scanning; keep our own
+  // transport row's play/pause icon in sync either way.
+  videoEl.addEventListener("play", () => state.refreshTransportUI?.());
+  videoEl.addEventListener("pause", () => state.refreshTransportUI?.());
+  videoEl.addEventListener("loadstart", () => {
+    status.textContent = "Loading video...";
+    status.style.display = "flex";
+  });
+  videoEl.addEventListener("canplay", () => {
+    status.style.display = "none";
+  });
+  videoEl.addEventListener("error", () => {
+    status.textContent = friendlyVideoError(videoEl.error);
+    status.style.display = "flex";
+  });
+
   state.videoEl = videoEl;
   state.videoContainer = container;
+  state.videoStatusEl = status;
   return widget;
 }
 
-// A real, directly-clickable native <button> — not drawn on the canvas.
-// Canvas-drawn buttons proved unreliable through LiteGraph's own dispatch
-// (the exact issue that made the old video controls not respond, and
-// likely the image fullscreen button too), so this uses the same fix
-// already proven for the fullscreen overlay's own button: a genuine DOM
-// element with a real click listener. A small fixed-height row, not
-// overlaid on the canvas — placed BEFORE preview in WIDGET_ORDER, so
-// (unlike the old transport bar) it never needs preview to already be
-// last to avoid overlap; it has nothing dynamic about its own size at
-// all. Only shown in image mode — video's own native controls already
-// have a fullscreen button.
-function buildFullscreenButtonWidget(node) {
+// Drag-able scrub bar — direct port of ComfyUI-VFX-Read's own scrub
+// widget. Hidden in video mode (native <video> already has one) and for a
+// single still frame (first === last).
+function buildScrubWidget(node) {
   const state = node.__vfxWritePreview;
 
   const container = el("div", {
     width: "100%",
-    display: "flex",
-    justifyContent: "flex-end",
+    display: "none",
+    alignItems: "center",
   });
 
-  const btn = el(
-    "button",
-    {
-      background: "#2c2c2c",
-      color: "#eee",
-      border: "1px solid #5a5a5a",
-      borderRadius: "3px",
-      padding: "3px 10px",
-      font: "11px sans-serif",
-      cursor: "pointer",
-    },
-    { textContent: "⛶ Fullscreen" }
-  );
-  btn.addEventListener("click", () => openFullscreen(node));
+  const rangeEl = document.createElement("input");
+  rangeEl.type = "range";
+  rangeEl.min = "1";
+  rangeEl.max = "1";
+  rangeEl.step = "1";
+  rangeEl.value = "1";
+  Object.assign(rangeEl.style, {
+    width: "100%",
+    accentColor: "#8a8a8a",
+    cursor: "pointer",
+  });
 
-  container.appendChild(btn);
+  rangeEl.addEventListener("input", () => {
+    const value = Number(rangeEl.value);
+    if (!Number.isFinite(value)) return;
+    showFrame(node, value);
+  });
 
-  const widget = node.addDOMWidget(FULLSCREEN_ROW_WIDGET, "fullscreen", container, {
+  container.appendChild(rangeEl);
+
+  const widget = node.addDOMWidget(SCRUB_WIDGET, "scrub", container, {
     serialize: false,
   });
-  widget.computeSize = (width) => [width, state.mode === "video" ? 0 : TRANSPORT_H];
+  widget.computeSize = (width) => [width, state.scrubVisible ? SCRUB_H : 0];
 
-  state.fullscreenBtnContainer = container;
+  state.scrubEl = rangeEl;
+  state.scrubContainer = container;
   return widget;
+}
+
+function refreshScrub(node) {
+  const state = node.__vfxWritePreview;
+  if (!state || !state.scrubEl) return;
+
+  const first = state.first ?? 1;
+  const last = state.last ?? first;
+  state.scrubEl.min = String(Math.min(first, last));
+  state.scrubEl.max = String(Math.max(first, last));
+
+  const visible = state.mode !== "video" && first < last;
+  state.scrubVisible = visible;
+  if (state.scrubContainer) {
+    state.scrubContainer.style.display = visible ? "flex" : "none";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -613,13 +862,15 @@ function showFrame(node, frameNumber) {
   const idx = state.frameList.indexOf(entry);
   const key = entry.frame ?? 0;
 
+  state.playhead = frameNumber;
+  if (state.scrubEl) state.scrubEl.value = String(frameNumber);
+
   const applyEntry = (k) => {
     const cacheEntry = state.cache.map.get(k);
     if (!cacheEntry?.ready || !cacheEntry.img) return;
     state.img = cacheEntry.img;
+    state.shownPath = entry.path;
     if (state.imgEl) {
-      // Reuses the cache entry's already-fetched URL, so this paints
-      // instantly from the browser's own HTTP cache rather than refetching.
       state.imgEl.src = cacheEntry.img.src;
       state.imgEl.style.display = "block";
     }
@@ -652,9 +903,6 @@ function showFrame(node, frameNumber) {
   }
 }
 
-// state.videoEl / state.videoContainer are built ONCE by buildVideoWidget
-// and persist for the node's lifetime — teardown/setup just hide/show and
-// change the source, they don't create or destroy the element itself.
 function teardownVideo(state) {
   state.mode = "image";
   if (state.videoEl) {
@@ -663,66 +911,34 @@ function teardownVideo(state) {
     state.videoEl.load();
   }
   if (state.videoContainer) state.videoContainer.style.display = "none";
-  if (state.fullscreenBtnContainer) state.fullscreenBtnContainer.style.display = "flex";
-  // computeSize()'s [width, 0] in video mode does NOT actually collapse a
-  // DOM widget's wrapper under Node 2.0 (confirmed live: the same
-  // "computeSize is ignored for hiding" behavior hit by before_range/
-  // after_range/missing_frames) — without this, the image container sat
-  // there as a thin black bar with "No output written yet." showing above
-  // the video. Explicit display toggling is required either way.
   if (state.previewContainer) state.previewContainer.style.display = "flex";
+  state.refreshTransportUI?.();
 }
 
 function setupVideo(node, state, path) {
   if (!state.videoEl) return;
   state.mode = "video";
   clearImageDisplay(state);
-  if (state.fullscreenBtnContainer) state.fullscreenBtnContainer.style.display = "none";
   if (state.previewContainer) state.previewContainer.style.display = "none";
-  // Always loop during preview: native <video controls> has no loop
-  // toggle of its own, and looping is the sensible default while
-  // reviewing a short clip.
-  state.videoEl.loop = true;
+  if (state.scrubContainer) state.scrubContainer.style.display = "none";
+  state.videoEl.loop = state.loop;
   state.videoEl.src = videoUrl(path);
   state.videoEl.load();
   if (state.videoContainer) state.videoContainer.style.display = "block";
+  state.refreshTransportUI?.();
 }
 
-async function loadVersion(node, pattern, version) {
+// Shared tail end of loading a version OR previewing a freshly-picked
+// file/sequence (see previewPicked below): given a resolved frameList,
+// sets up video/scrub state and shows the first frame. Split out so both
+// callers stay in sync rather than duplicating this logic.
+async function applyFrameList(node, frameList) {
   const state = node.__vfxWritePreview;
-  if (!state || !pattern || version === undefined || version === null) return;
-
-  stopPlay(node);
-  teardownVideo(state);
-  cacheClear(state.cache);
-  clearImageDisplay(state);
-  state.frameList = [];
-  state.currentFrame = null;
-
-  let frameData;
-  try {
-    frameData = await apiGet("/vfx-write/frames", { path: pattern, version });
-  } catch (_) {
-    frameData = { frames: [] };
-  }
-
-  if (frameData.frames && frameData.frames.length) {
-    state.frameList = frameData.frames
-      .slice()
-      .sort((a, b) => a.frame - b.frame)
-      .map((f) => ({ frame: f.frame, path: f.path }));
-  } else {
-    const versions = node.__vfxWriteVersions || [];
-    const match = versions.find((v) => v.version === version);
-    if (match) state.frameList = [{ frame: null, path: match.path }];
-  }
+  state.frameList = frameList;
 
   if (!state.frameList.length) {
     state.filename = "";
-    node.__vfxWriteRestoring = true;
-    setWidget(node, FIRST_WIDGET, 1);
-    setWidget(node, LAST_WIDGET, 1);
-    node.__vfxWriteRestoring = false;
+    refreshScrub(node);
     node.setDirtyCanvas?.(true, true);
     return;
   }
@@ -733,13 +949,9 @@ async function loadVersion(node, pattern, version) {
     setupVideo(node, state, single.path);
     state.filename = single.path;
 
-    // first/last become real ffprobe-derived info about the video being
-    // BROWSED — purely informational (so you know the valid range before
-    // typing a frame to extract). Deliberately NOT touching `frame` here:
-    // it's a real write()-time input controlling what gets extracted on
-    // the NEXT run, and browsing an old version must never silently
-    // change that (same "browsing never affects what gets written next"
-    // rule as the version picker itself).
+    // Purely informational — the range of the video being BROWSED, so the
+    // scrub bar (hidden in video mode anyway) has sane bounds if the mode
+    // changes later. Never touches the real `frame` input.
     let info = null;
     try {
       info = await apiGet("/vfx-write/video-info", { path: single.path });
@@ -747,11 +959,9 @@ async function loadVersion(node, pattern, version) {
       info = null;
     }
 
-    node.__vfxWriteRestoring = true;
-    setWidget(node, FIRST_WIDGET, info?.first ?? 1);
-    setWidget(node, LAST_WIDGET, info?.last ?? 1);
-    node.__vfxWriteRestoring = false;
-
+    state.first = info?.first ?? 1;
+    state.last = info?.last ?? 1;
+    refreshScrub(node);
     node.setDirtyCanvas?.(true, true);
     return;
   }
@@ -760,127 +970,119 @@ async function loadVersion(node, pattern, version) {
   const rangeFirst = nums.length ? Math.min(...nums) : 1;
   const rangeLast = nums.length ? Math.max(...nums) : 1;
 
-  node.__vfxWriteRestoring = true;
-  setWidget(node, FIRST_WIDGET, rangeFirst);
-  setWidget(node, LAST_WIDGET, rangeLast);
-  setWidget(node, FRAME_WIDGET, rangeFirst);
-  node.__vfxWriteRestoring = false;
+  state.first = rangeFirst;
+  state.last = rangeLast;
+  refreshScrub(node);
 
   showFrame(node, rangeFirst);
 }
 
-// ---------------------------------------------------------------------------
-// version picker
-// ---------------------------------------------------------------------------
-
-async function refreshVersionList(node) {
-  const versionWidget = getWidget(node, VERSION_WIDGET);
-  if (!versionWidget) return;
-
-  const pattern = patternOf(node);
-
-  if (!pattern) {
-    versionWidget.options.values = [];
-    setWidget(node, VERSION_WIDGET, "");
-    return;
-  }
-
-  let data;
-
-  try {
-    data = await apiGet("/vfx-write/versions", { path: pattern });
-  } catch (_) {
-    return;
-  }
-
-  const versions = data.versions || [];
-  node.__vfxWriteVersions = versions;
-
-  const labels = versions.map((v) => `v${String(v.version).padStart(2, "0")}`);
-  versionWidget.options.values = labels;
-
-  if (labels.length) {
-    setWidget(node, VERSION_WIDGET, labels[labels.length - 1]);
-    const latest = versions[versions.length - 1];
-    loadVersion(node, pattern, latest.version);
-  } else {
-    setWidget(node, VERSION_WIDGET, "");
-  }
-}
-
-// ---------------------------------------------------------------------------
-// frame / first / last watchers
-// ---------------------------------------------------------------------------
-
-// Clamping only makes sense when there's an actual multi-frame IMAGE
-// SEQUENCE loaded to scrub through (state.frameList.length > 1) — that's
-// the only case where `frame` directly selects a real, already-cached
-// preview thumbnail. In every other case — a fresh node before any
-// version is loaded, a single image, or a video (frameList is a 1-entry
-// dummy there, and first/last are just informational display of whatever
-// video is currently BROWSED, not a bound on what write() should extract
-// next) — `frame` is a forward-looking write()-time input with no real
-// range to clamp against yet. Clamping it anyway was a real bug: on a
-// fresh node first/last default to 1/1, so typing frame=30 before ever
-// loading a version got silently reset to 1. Out-of-range values are
-// instead caught at write() time with a clear ffmpeg error, same as Read.
-function clampFrameToRange(node) {
+function resetPreviewForLoad(node) {
   const state = node.__vfxWritePreview;
-  if (!state || state.frameList.length <= 1) return;
-
-  const first = numValue(node, FIRST_WIDGET, 1);
-  const last = numValue(node, LAST_WIDGET, 1);
-  if (first > last) return;
-
-  const cur = numValue(node, FRAME_WIDGET, first);
-  let next = cur;
-  if (next < first) next = first;
-  else if (next > last) next = last;
-
-  if (next !== cur) {
-    setWidget(node, FRAME_WIDGET, next);
-  } else {
-    showFrame(node, cur);
-  }
+  stopPlay(node);
+  teardownVideo(state);
+  cacheClear(state.cache);
+  clearImageDisplay(state);
+  state.currentFrame = null;
+  state.playhead = 1;
+  state.first = 1;
+  state.last = 1;
+  return state;
 }
 
-function installWatchers(node) {
-  watchWidgetValue(getWidget(node, FRAME_WIDGET), (v) => {
-    if (node.__vfxWriteRestoring) return;
+async function loadVersion(node, pattern, version) {
+  const state = node.__vfxWritePreview;
+  if (!state || !pattern || version === undefined || version === null) return;
 
-    const state = node.__vfxWritePreview;
-    if (!state || state.frameList.length <= 1) return;
+  resetPreviewForLoad(node);
 
-    const first = numValue(node, FIRST_WIDGET, 1);
-    const last = numValue(node, LAST_WIDGET, 1);
-    const num = Number(v);
-    if (!Number.isFinite(num)) return;
-
-    if (first <= last) {
-      if (num < first) {
-        setWidget(node, FRAME_WIDGET, first);
-        return;
-      }
-      if (num > last) {
-        setWidget(node, FRAME_WIDGET, last);
-        return;
-      }
-    }
-
-    showFrame(node, num);
-  });
-
-  for (const name of [FIRST_WIDGET, LAST_WIDGET]) {
-    watchWidgetValue(getWidget(node, name), () => {
-      if (node.__vfxWriteRestoring) return;
-      clampFrameToRange(node);
-    });
+  let frameData;
+  try {
+    frameData = await apiGet("/vfx-write/frames", { path: pattern, version });
+  } catch (_) {
+    frameData = { frames: [] };
   }
+
+  let frameList;
+  if (frameData.frames && frameData.frames.length) {
+    frameList = frameData.frames
+      .slice()
+      .sort((a, b) => a.frame - b.frame)
+      .map((f) => ({ frame: f.frame, path: f.path }));
+  } else {
+    const versions = node.__vfxWriteVersions || [];
+    const match = versions.find((v) => v.version === version);
+    frameList = match ? [{ frame: null, path: match.path }] : [];
+  }
+
+  await applyFrameList(node, frameList);
+}
+
+// Previews exactly what was just picked in the browse dialog (a single
+// file, or a collapsed sequence group — see group_files/pick), completely
+// independent of whether the resulting destination fits any versioned
+// naming convention at all. Confirmed live as a real gap: a plain,
+// unversioned file (or sequence) picked in the dialog correctly set
+// path/file_name, but the canvas stayed empty forever — refreshVersionList
+// only ever calls loadVersion() when list_versions finds at least one
+// version, so a destination with none never got previewed. `pattern` is
+// the already-guessed combined destination (folder + v##/#### template),
+// used to scope the /vfx-write/frames-in-folder lookup for a sequence.
+async function previewPicked(node, f, pattern) {
+  const state = node.__vfxWritePreview;
+  if (!state || !f) return;
+
+  resetPreviewForLoad(node);
+
+  let frameList;
+
+  if (f.kind === "sequence") {
+    let frameData;
+    try {
+      frameData = await apiGet("/vfx-write/frames-in-folder", { path: pattern });
+    } catch (_) {
+      frameData = { frames: [] };
+    }
+    frameList = (frameData.frames || [])
+      .slice()
+      .sort((a, b) => a.frame - b.frame)
+      .map((fr) => ({ frame: fr.frame, path: fr.path }));
+
+    // Fall back to just the one representative frame if the folder scan
+    // came up empty for some reason (e.g. a race with files changing on
+    // disk) — still better than showing nothing for a file we know exists.
+    if (!frameList.length) frameList = [{ frame: null, path: f.path }];
+  } else {
+    frameList = [{ frame: null, path: f.path }];
+  }
+
+  await applyFrameList(node, frameList);
 }
 
 // ---------------------------------------------------------------------------
 // playback
 // ---------------------------------------------------------------------------
+
+function stepFrame(node, delta) {
+  const state = node.__vfxWritePreview;
+  if (!state) return;
+
+  if (state.mode === "video") {
+    const videoEl = state.videoEl;
+    if (!videoEl) return;
+    videoEl.pause();
+    const duration = Number.isFinite(videoEl.duration) ? videoEl.duration : Infinity;
+    videoEl.currentTime = Math.max(0, Math.min(duration, videoEl.currentTime + delta / DEFAULT_FPS));
+    state.refreshTransportUI?.();
+    return;
+  }
+
+  if (!state.frameList.length) return;
+  const first = state.first ?? 1;
+  const last = state.last ?? first;
+  const next = Math.min(Math.max((state.playhead ?? first) + delta, first), last);
+  showFrame(node, next);
+}
 
 function togglePlay(node) {
   const state = node.__vfxWritePreview;
@@ -890,7 +1092,7 @@ function togglePlay(node) {
 
 function startPlay(node) {
   const state = node.__vfxWritePreview;
-  if (!state || state.playing) return;
+  if (!state || state.playing || state.mode === "video") return;
   if (!state.frameList.length) return;
 
   state.playing = true;
@@ -909,22 +1111,22 @@ function startPlay(node) {
       const advance = Math.floor(state.acc / step);
       state.acc -= advance * step;
 
-      const first = numValue(node, FIRST_WIDGET, 1);
-      const last = numValue(node, LAST_WIDGET, 1);
-      let next = numValue(node, FRAME_WIDGET, first) + advance;
+      const first = state.first ?? 1;
+      const last = state.last ?? first;
+      let next = (state.playhead ?? first) + advance;
 
       if (next > last) {
         if (state.loop) {
           const span = Math.max(1, last - first + 1);
           next = first + ((next - first) % span);
         } else {
-          setWidget(node, FRAME_WIDGET, last);
+          showFrame(node, last);
           stopPlay(node);
           return;
         }
       }
 
-      setWidget(node, FRAME_WIDGET, next);
+      showFrame(node, next);
     }
 
     state.rafId = requestAnimationFrame(tick);
@@ -943,14 +1145,96 @@ function stopPlay(node) {
 }
 
 // ---------------------------------------------------------------------------
-// fullscreen review
+// transport - real DOM buttons (play/prev/next/loop/fullscreen). Shared by
+// both preview modes, same as ComfyUI-VFX-Read's transport row, minus its
+// "Use Frame" button — nothing here writes into the real `frame` input, see
+// the header design note.
 // ---------------------------------------------------------------------------
 
-// Real browser Fullscreen API (takes over the whole monitor, hides browser
-// chrome) on the overlay element, not just a full-viewport-sized div —
-// falls back silently to the plain overlay if the browser refuses (no
-// user-gesture context, permissions policy, etc.), since the overlay is
-// still a usable large preview either way.
+function buildTransportWidget(node) {
+  const state = node.__vfxWritePreview;
+  const btn = smallBtn;
+
+  function setActive(b, active) {
+    b.style.background = active ? "#3a5a8a" : "#2c2c2c";
+    b.style.borderColor = active ? "#6f9ad0" : "#4a4a4a";
+  }
+
+  const container = el("div", {
+    width: "100%",
+    display: "flex",
+    gap: "4px",
+    alignItems: "center",
+  });
+
+  const playBtn = btn("▶", "Play/Pause");
+  const prevBtn = btn("⏮", "Previous frame");
+  const nextBtn = btn("⏭", "Next frame");
+  const loopBtn = btn("↻", "Loop");
+  const spacer = el("div", { flex: "1" });
+  const fsBtn = btn("⛶", "Fullscreen");
+
+  function refreshTransportUI() {
+    const isPlaying = state.mode === "video" ? !!state.videoEl && !state.videoEl.paused : state.playing;
+    playBtn.textContent = isPlaying ? "⏸" : "▶";
+
+    const loopActive = state.mode === "video" ? !!state.videoEl?.loop : state.loop;
+    setActive(loopBtn, loopActive);
+  }
+
+  playBtn.addEventListener("click", () => {
+    if (state.mode === "video") {
+      if (!state.videoEl) return;
+      if (state.videoEl.paused) state.videoEl.play();
+      else state.videoEl.pause();
+    } else {
+      togglePlay(node);
+    }
+    refreshTransportUI();
+  });
+
+  prevBtn.addEventListener("click", () => stepFrame(node, -1));
+  nextBtn.addEventListener("click", () => stepFrame(node, 1));
+
+  loopBtn.addEventListener("click", () => {
+    state.loop = !state.loop;
+    if (state.mode === "video" && state.videoEl) state.videoEl.loop = state.loop;
+    refreshTransportUI();
+  });
+
+  fsBtn.addEventListener("click", () => {
+    if (state.fsOpen && state.closeFullscreen) {
+      state.closeFullscreen();
+      return;
+    }
+    openFullscreen(node);
+  });
+
+  refreshTransportUI();
+
+  container.appendChild(playBtn);
+  container.appendChild(prevBtn);
+  container.appendChild(nextBtn);
+  container.appendChild(loopBtn);
+  container.appendChild(spacer);
+  container.appendChild(fsBtn);
+
+  const widget = node.addDOMWidget(TRANSPORT_WIDGET, "transport", container, {
+    serialize: false,
+  });
+  widget.computeSize = (width) => [width, TRANSPORT_H];
+
+  state.transportWidget = widget;
+  state.transportContainer = container;
+  state.refreshTransportUI = refreshTransportUI;
+  return widget;
+}
+
+// ---------------------------------------------------------------------------
+// fullscreen review — single entry point dispatches to whichever mode is
+// active, same pattern as ComfyUI-VFX-Read's openFullscreen.
+// ---------------------------------------------------------------------------
+
 function requestRealFullscreen(element) {
   const req = element.requestFullscreen || element.webkitRequestFullscreen;
   if (!req) return;
@@ -971,28 +1255,19 @@ function exitRealFullscreen() {
   } catch (_) {}
 }
 
-// Image/sequence only — video is a real embedded <video controls> element
-// (see buildVideoWidget) with its own native fullscreen button, so this
-// is never reached in video mode (PREVIEW_WIDGET's mouse() short-circuits
-// before calling this then).
-// Full-resolution URL, not the small (max 640x420) thumbnail the little
-// canvas preview uses — that thumbnail was also the earlier bug: an <img>
-// sized only by max-width/max-height never grows PAST its own intrinsic
-// size, so a 640x420 source just sat small in the middle of the screen no
-// matter how big the overlay was.
-function fullImageUrl(sourcePath) {
-  const url = new URL("/vfx-write/image", window.location.origin);
-  url.searchParams.set("path", sourcePath || "");
-  return url.toString();
-}
-
 function openFullscreen(node) {
   const state = node.__vfxWritePreview;
-  if (!state || !state.img) return;
+  if (!state) return;
+  if (state.mode === "video") openVideoFullscreen(node, state);
+  else openImageFullscreen(node, state);
+}
 
-  const entry = state.frameList[state.frameIndex] || state.frameList[0];
-  const sourcePath = entry?.path;
-  if (!sourcePath) return;
+// Image/sequence mode: real Fullscreen API, full-resolution source,
+// wheel-zoom, drag-to-pan.
+function openImageFullscreen(node, state) {
+  if (!state.img || !state.shownPath) return;
+
+  const sourcePath = state.shownPath;
 
   const overlay = el("div", {
     position: "fixed",
@@ -1002,8 +1277,6 @@ function openFullscreen(node) {
     overflow: "hidden",
   });
 
-  // Fills the overlay at all times; the <img> inside is what actually
-  // scales/pans via CSS transform for zoom, independent of this box.
   const viewport = el("div", {
     width: "100%",
     height: "100%",
@@ -1011,10 +1284,6 @@ function openFullscreen(node) {
     cursor: "grab",
   });
 
-  // width/height:100% + object-fit — NOT max-width/max-height — so a
-  // small source image is scaled UP to fill the screen too, not just
-  // capped when it's larger. object-fit:contain keeps the aspect ratio
-  // either way.
   const img = el("img", {
     width: "100%",
     height: "100%",
@@ -1094,10 +1363,7 @@ function openFullscreen(node) {
   viewport.addEventListener("dblclick", resetView);
 
   function sync() {
-    // Keep showing the frame currently on the small preview if it changes
-    // (e.g. still playing an image sequence) while fullscreen is open.
-    const current = state.frameList[state.frameIndex] || state.frameList[0];
-    const p = current?.path;
+    const p = state.shownPath;
     if (p && !img.src.endsWith(encodeURIComponent(p))) {
       img.src = fullImageUrl(p);
     }
@@ -1116,14 +1382,14 @@ function openFullscreen(node) {
     document.removeEventListener("keydown", onKey);
     document.removeEventListener("fullscreenchange", onFsChange);
     document.removeEventListener("webkitfullscreenchange", onFsChange);
+    state.fsOpen = false;
+    state.closeFullscreen = null;
   }
 
   function onKey(e) {
     if (e.key === "Escape") close();
   }
 
-  // The browser's own Escape/UI exits real fullscreen without going
-  // through onKey/click — catch that here so the overlay still cleans up.
   function onFsChange() {
     if (!document.fullscreenElement && !document.webkitFullscreenElement) close();
   }
@@ -1172,18 +1438,97 @@ function openFullscreen(node) {
   overlay.appendChild(closeBtn);
   overlay.appendChild(hint);
   document.body.appendChild(overlay);
+  state.fsOpen = true;
+  state.closeFullscreen = close;
   requestRealFullscreen(overlay);
 }
 
-// A real, directly-clickable native <button> inside the overlay. The
-// automatic requestRealFullscreen() call right after opening the overlay
-// may not always carry a valid "user activation" through LiteGraph's own
-// canvas event dispatch by the time it runs — this guarantees one
-// reliable path regardless, rather than leaving real fullscreen to chance
-// (or to the viewer stumbling onto the video's own native controls, which
-// don't exist for the image case anyway).
-function fullscreenButton(targetElement) {
-  const btn = el(
+// Video mode: reparents the *existing* <video> element (and the shared
+// transport row) into the overlay rather than creating a second video/
+// second set of buttons — preserves playback position, and every button
+// keeps working fullscreen with zero duplicated logic. Both get moved back
+// to their normal spot in the node on close.
+function openVideoFullscreen(node, state) {
+  const videoEl = state.videoEl;
+  const transportEl = state.transportContainer;
+  if (!videoEl || !transportEl) return;
+
+  const videoOriginalParent = videoEl.parentElement;
+  const videoOriginalNext = videoEl.nextSibling;
+  const videoOriginalStyle = videoEl.getAttribute("style");
+
+  const transportOriginalParent = transportEl.parentElement;
+  const transportOriginalNext = transportEl.nextSibling;
+
+  const overlay = el("div", {
+    position: "fixed",
+    inset: "0",
+    background: "#000",
+    zIndex: "10001",
+    display: "flex",
+    flexDirection: "column",
+  });
+
+  const stage = el("div", {
+    flex: "1 1 auto",
+    minHeight: "0",
+    position: "relative",
+    overflow: "hidden",
+    display: "flex",
+  });
+
+  Object.assign(videoEl.style, {
+    width: "100%",
+    height: "100%",
+    display: "block",
+    objectFit: "contain",
+    background: "#000",
+  });
+  stage.appendChild(videoEl);
+
+  const barRow = el("div", {
+    flex: "0 0 auto",
+    padding: "6px 8px",
+    background: "#181818",
+    borderTop: "1px solid #333",
+  });
+  barRow.appendChild(transportEl);
+
+  let closed = false;
+
+  function restore() {
+    if (videoOriginalStyle === null) videoEl.removeAttribute("style");
+    else videoEl.setAttribute("style", videoOriginalStyle);
+    videoOriginalParent.insertBefore(videoEl, videoOriginalNext);
+    transportOriginalParent.insertBefore(transportEl, transportOriginalNext);
+  }
+
+  function close() {
+    if (closed) return;
+    closed = true;
+    exitRealFullscreen();
+    restore();
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("fullscreenchange", onFsChange);
+    document.removeEventListener("webkitfullscreenchange", onFsChange);
+    state.fsOpen = false;
+    state.closeFullscreen = null;
+  }
+
+  function onKey(e) {
+    if (e.key === "Escape") close();
+  }
+
+  function onFsChange() {
+    if (!document.fullscreenElement && !document.webkitFullscreenElement) close();
+  }
+
+  document.addEventListener("keydown", onKey);
+  document.addEventListener("fullscreenchange", onFsChange);
+  document.addEventListener("webkitfullscreenchange", onFsChange);
+
+  const closeBtn = el(
     "button",
     {
       position: "absolute",
@@ -1198,20 +1543,69 @@ function fullscreenButton(targetElement) {
       font: "12px sans-serif",
       cursor: "pointer",
     },
-    { textContent: "⛶ Fullscreen" }
+    { textContent: "✕ Close" }
   );
-
-  btn.addEventListener("click", (e) => {
+  closeBtn.addEventListener("click", (e) => {
     e.stopPropagation();
-    requestRealFullscreen(targetElement);
+    close();
   });
+  stage.appendChild(closeBtn);
 
-  return btn;
+  overlay.appendChild(stage);
+  overlay.appendChild(barRow);
+  document.body.appendChild(overlay);
+  state.fsOpen = true;
+  state.closeFullscreen = close;
+  requestRealFullscreen(overlay);
 }
 
 // ---------------------------------------------------------------------------
-// destination browser (folder navigation + filename)
+// destination browser
 // ---------------------------------------------------------------------------
+
+// Given an existing on-disk filename, guesses the v##/#### template: the
+// rightmost v01/v02-style version token becomes v## (padding matched),
+// then the rightmost remaining run of 3+ digits (typically a frame
+// number) becomes #### (padding matched). Best-effort — picking a file
+// runs this so the destination pattern is pre-filled instead of typed by
+// hand; the result is still just a normal editable string in the file
+// row afterward.
+function patternFromExampleFilename(name) {
+  const versionRe = /[vV](\d{1,2})(?!\d)/g;
+  let versionMatch = null;
+  let m;
+  while ((m = versionRe.exec(name))) versionMatch = m;
+
+  let result = name;
+
+  if (versionMatch) {
+    const digitsStart = versionMatch.index + 1;
+    const digitsEnd = digitsStart + versionMatch[1].length;
+    result =
+      result.slice(0, digitsStart) +
+      "#".repeat(versionMatch[1].length) +
+      result.slice(digitsEnd);
+  }
+
+  // Frame numbers sit immediately before the extension (name.0001.exr,
+  // name_0001.exr) — anchoring to "right before the extension" avoids
+  // mistaking an embedded number elsewhere in the name (e.g. a shot
+  // number like "010" in "shot_010_comp_v01.png") for a frame token.
+  // Confirmed live: a plain /\d{3,}/ search (no anchor) wrongly matched
+  // "010" and produced "shot_###_comp_v##.png" for a single non-sequence
+  // file.
+  const dot = result.lastIndexOf(".");
+  const base = dot >= 0 ? result.slice(0, dot) : result;
+  const ext = dot >= 0 ? result.slice(dot) : "";
+  const frameMatch = base.match(/(\d{3,})$/);
+
+  if (frameMatch) {
+    const start = base.length - frameMatch[1].length;
+    result = base.slice(0, start) + "#".repeat(frameMatch[1].length) + ext;
+  }
+
+  return result;
+}
 
 function buildBrowseDialog(node) {
   const overlay = el("div", {
@@ -1255,12 +1649,18 @@ function buildBrowseDialog(node) {
     font: "11px monospace",
   });
 
-  const upBtn = el("button", { flex: "0 0 auto" }, { textContent: "Up" });
-  const goBtn = el("button", { flex: "0 0 auto" }, { textContent: "Go" });
+  // Enter already submits the typed path (see the keydown handler below),
+  // so a separate "Go" button was pure duplication — same as
+  // ComfyUI-VFX-Read's own dialog. Back/Forward/Up replace the old lone
+  // "Up" button.
+  const backBtn = smallBtn("←", "Back");
+  const forwardBtn = smallBtn("→", "Forward");
+  const upBtn = smallBtn("↑", "Up one level");
 
   head.appendChild(pathInput);
+  head.appendChild(backBtn);
+  head.appendChild(forwardBtn);
   head.appendChild(upBtn);
-  head.appendChild(goBtn);
 
   const list = el("div", { flex: "1 1 auto", overflowY: "auto", padding: "4px 0" });
 
@@ -1272,7 +1672,7 @@ function buildBrowseDialog(node) {
     borderTop: "1px solid #3a3a3a",
   });
   hint.textContent =
-    "Choosing a folder only. Set the file name (with its v## token) in the node's own \"file name\" field.";
+    "Click a file to fill the destination from it (guesses its v##/#### tokens) — or pick an empty folder and type the file name pattern yourself.";
 
   const foot = el("div", {
     flex: "0 0 auto",
@@ -1295,6 +1695,26 @@ function buildBrowseDialog(node) {
   overlay.appendChild(panel);
 
   let currentFolder = "";
+  let currentParent = "";
+
+  // Browser-style history — same pattern as ComfyUI-VFX-Read's own dialog.
+  // requestGen guards against a stale response landing after a newer
+  // request has already started.
+  let history = [];
+  let historyIndex = -1;
+  let requestGen = 0;
+
+  function setNavEnabled(btn, enabled) {
+    btn.disabled = !enabled;
+    btn.style.opacity = enabled ? "1" : "0.4";
+    btn.style.cursor = enabled ? "pointer" : "default";
+  }
+
+  function updateNavButtons() {
+    setNavEnabled(backBtn, historyIndex > 0);
+    setNavEnabled(forwardBtn, historyIndex < history.length - 1);
+    setNavEnabled(upBtn, !!currentParent && currentParent !== currentFolder);
+  }
 
   function close() {
     overlay.remove();
@@ -1324,23 +1744,58 @@ function buildBrowseDialog(node) {
     return r;
   }
 
-  async function load(dir) {
+  // Picking an existing file (or a collapsed sequence group — see
+  // group_files/_group_files on the backend) adopts its folder as `path`
+  // and guesses a v##/#### pattern from its representative file's name as
+  // `file_name` — same "pick a real example, get a usable pattern" flow
+  // as choosing a folder, just seeded from a concrete file instead of
+  // typed by hand. `f.path` is always a single real file (a sequence
+  // group's is its first frame), so this works the same for both kinds.
+  async function pick(f) {
+    const fullPath = f.path.replace(/\\/g, "/");
+    const idx = fullPath.lastIndexOf("/");
+    const folder = (idx >= 0 ? fullPath.slice(0, idx) : currentFolder).replace(/\/+$/, "");
+    const fileName = idx >= 0 ? fullPath.slice(idx + 1) : fullPath;
+    const pattern = patternFromExampleFilename(fileName);
+    const combined = folder ? `${folder}/${pattern}` : pattern;
+    applyCombinedInput(node, combined);
+    refreshFileRowDisplay(node);
+    // Always preview exactly what was picked, whether or not it fits a
+    // versioned naming convention — see previewPicked's own design note.
+    await previewPicked(node, f, combined);
+    close();
+  }
+
+  async function load(dir, opts = {}) {
+    const gen = ++requestGen;
+
     list.replaceChildren();
     row("Loading...", "", null);
-    let data;
 
+    let data;
     try {
       data = await apiGet("/vfx-write/browse", { path: dir || "" });
     } catch (e) {
+      if (gen !== requestGen) return;
       list.replaceChildren();
       row(`Error: ${e.message}`, "", null);
       return;
     }
 
-    list.replaceChildren();
+    if (gen !== requestGen) return;
 
     currentFolder = data.folder || "";
+    currentParent = data.parent || "";
     pathInput.value = currentFolder;
+
+    if (!opts.fromHistory) {
+      history = history.slice(0, historyIndex + 1);
+      history.push(currentFolder);
+      historyIndex = history.length - 1;
+    }
+    updateNavButtons();
+
+    list.replaceChildren();
 
     if (data.parent && data.parent !== currentFolder) {
       row(".. (parent)", "dir", () => load(data.parent));
@@ -1350,23 +1805,27 @@ function buildBrowseDialog(node) {
       row(d.name, "dir", () => load(d.path));
     }
 
-    // Files are shown for context only (so you can see what's already in
-    // a folder) — nothing to pick, this dialog only chooses a folder.
     for (const f of data.files || []) {
-      row(f, "file");
+      const sub = f.kind === "sequence" ? `seq ${f.first}-${f.last}` : "file";
+      row(f.label || f.path, sub, () => pick(f));
     }
 
     if (!list.children.length) row("(empty)", "", null);
   }
 
-  upBtn.addEventListener("click", async () => {
-    try {
-      const data = await apiGet("/vfx-write/browse", { path: currentFolder });
-      if (data.parent && data.parent !== data.folder) load(data.parent);
-    } catch (_) {}
+  backBtn.addEventListener("click", () => {
+    if (historyIndex <= 0) return;
+    historyIndex--;
+    load(history[historyIndex], { fromHistory: true });
   });
-
-  goBtn.addEventListener("click", () => load(pathInput.value));
+  forwardBtn.addEventListener("click", () => {
+    if (historyIndex >= history.length - 1) return;
+    historyIndex++;
+    load(history[historyIndex], { fromHistory: true });
+  });
+  upBtn.addEventListener("click", () => {
+    if (currentParent && currentParent !== currentFolder) load(currentParent);
+  });
   pathInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") load(pathInput.value);
   });
@@ -1376,9 +1835,8 @@ function buildBrowseDialog(node) {
     const folder = (typed || currentFolder).replace(/\\/g, "/").replace(/\/+$/, "");
     if (!folder) return;
 
-    const pathWidget = getWidget(node, "path");
     setWidget(node, "path", folder);
-    pathWidget?.callback?.(folder);
+    refreshFileRowDisplay(node);
     refreshVersionList(node);
     close();
   });
@@ -1387,6 +1845,12 @@ function buildBrowseDialog(node) {
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) close();
   });
+
+  // Shields the dialog's own inputs from document/window-level keyboard
+  // handling (e.g. LiteGraph's own canvas shortcuts) the same way
+  // ComfyUI-VFX-Read's dialog does.
+  overlay.addEventListener("keydown", (e) => e.stopPropagation());
+  overlay.addEventListener("paste", (e) => e.stopPropagation());
 
   document.body.appendChild(overlay);
 
@@ -1408,86 +1872,34 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const result = onNodeCreated?.apply(this, arguments);
 
-      this.addWidget("button", BROWSE_WIDGET, "", () => {
-        buildBrowseDialog(this);
-      });
-
-      const versionWidget = this.addWidget(
-        "combo",
-        VERSION_WIDGET,
-        "",
-        (value) => {
-          const versions = this.__vfxWriteVersions || [];
-          const match = versions.find(
-            (v) => `v${String(v.version).padStart(2, "0")}` === value
-          );
-
-          if (match) {
-            loadVersion(this, patternOf(this), match.version);
-          }
-        },
-        { values: [] }
-      );
-      versionWidget.label = "Preview version";
-      versionWidget.serialize = false;
-
-      // "frame" is NOT created here — it's a real Python input now
-      // (declared in INPUT_TYPES, write() uses it to extract a frame back
-      // out of a written video), so ComfyUI already auto-creates its
-      // native widget before onNodeCreated runs, same as path/file_name/
-      // frame_start. It persists and restores through the same
-      // name-keyed path as those (see VALUE_WIDGETS / onConfigure).
-
-      const firstWidget = this.addWidget(
-        "number",
-        FIRST_WIDGET,
-        1,
-        () => {},
-        { min: 0, max: 10000000, step: 1, precision: 0 }
-      );
-      firstWidget.serialize = false;
-
-      const lastWidget = this.addWidget(
-        "number",
-        LAST_WIDGET,
-        1,
-        () => {},
-        { min: 0, max: 10000000, step: 1, precision: 0 }
-      );
-      lastWidget.serialize = false;
-
       buildPreviewWidget(this);
-      buildVideoWidget(this);
-      buildFullscreenButtonWidget(this);
-      installWatchers(this);
 
-      for (const name of ["path", "file_name"]) {
-        const w = getWidget(this, name);
-        if (!w) continue;
-
-        const onChange = w.callback;
-
-        w.callback = (...args) => {
-          const out = onChange?.apply(w, args);
-          refreshVersionList(this);
-          return out;
-        };
+      // Convert the execution-critical native widgets into invisible
+      // DOM-backed carriers FIRST, so the file row can immediately read
+      // their current (INPUT_TYPES-default) values. See the design note
+      // near buildHiddenValue/replaceWithHiddenCarrier.
+      for (const name of ["path", "file_name", "frame_start"]) {
+        replaceWithHiddenCarrier(this, name);
       }
 
-      reorderWidgets(this);
-      refreshVersionList(this);
+      buildFileRow(this);
+      buildVersionRow(this);
 
-      // LiteGraph's node-creation default size does not consult custom
-      // widgets' own computeSize() (confirmed live: a fresh node stays at
-      // its generic default size indefinitely, well short of what preview
-      // + transport + all the numeric widgets actually need). chromeOf()
-      // measures the fixed non-preview total via its own bootstrap path
-      // (does not touch this.size), so the correct initial fit is exactly
-      // chrome + PREVIEW_DEFAULT_H — computed directly rather than via a
-      // second this.computeSize() call, which would read the STILL-stale
-      // this.size at this point and fit to the wrong number.
+      buildVideoWidget(this);
+      buildScrubWidget(this);
+      buildTransportWidget(this);
+
+      if (this.size[0] < MIN_NODE_W) this.size[0] = MIN_NODE_W;
+
+      reorderWidgets(this);
+
+      // Deterministic initial size — chrome + PREVIEW_DEFAULT_H — computed
+      // directly rather than via a second this.computeSize() call (which
+      // would read the still-stale this.size at this point).
       const chrome = chromeOf(this);
       this.setSize([this.size[0], chrome + PREVIEW_DEFAULT_H]);
+
+      refreshVersionList(this);
 
       return result;
     };
@@ -1509,22 +1921,16 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function (o) {
       const r = onConfigure?.apply(this, arguments);
 
-      installWatchers(this);
       reorderWidgets(this);
 
-      // Just prime the cache on this (freshly constructed) node instance —
-      // deliberately NOT resizing here. The saved this.size (the user's
-      // own prior resize, if any) is already correct as restored; chromeOf
-      // only reads widgets' own computeSize(), never this.size, so it
-      // can't disturb it.
+      // Just prime the chrome cache on this (freshly constructed) node
+      // instance — deliberately NOT resizing here. The saved this.size
+      // (the user's own prior resize, if any) is already correct as
+      // restored.
       chromeOf(this);
 
-      this.__vfxWriteRestoring = true;
-      try {
-        applyValues(this, o?.vfx_write_values);
-      } finally {
-        this.__vfxWriteRestoring = false;
-      }
+      applyValues(this, o?.vfx_write_values);
+      refreshFileRowDisplay(this);
 
       setTimeout(() => refreshVersionList(this), 0);
 
@@ -1556,6 +1962,27 @@ app.registerExtension({
       }
       this.__vfxWritePreview = null;
       return onRemoved?.apply(this, arguments);
+    };
+
+    // Manual escape hatch for a node that's ended up taller than its
+    // content needs — same "Reset Size" ComfyUI-VFX-Read added. Keeps the
+    // current width, only resets the height back to natural chrome +
+    // PREVIEW_DEFAULT_H.
+    const getExtraMenuOptions = nodeType.prototype.getExtraMenuOptions;
+
+    nodeType.prototype.getExtraMenuOptions = function (canvas, options) {
+      const r = getExtraMenuOptions?.apply(this, arguments);
+      const node = this;
+      options.push({
+        content: "Reset Size",
+        callback: () => {
+          node.__vfxWriteChrome = undefined;
+          const chrome = chromeOf(node);
+          node.setSize([node.size[0], chrome + PREVIEW_DEFAULT_H]);
+          node.setDirtyCanvas?.(true, true);
+        },
+      });
+      return r;
     };
   },
 });
