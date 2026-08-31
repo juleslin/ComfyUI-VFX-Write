@@ -19,6 +19,17 @@ from .nodes import (
 
 routes = PromptServer.instance.routes
 
+# Applied to every route that serves image/video bytes by path. Without
+# this, the browser's own HTTP cache can serve stale bytes for a path
+# whose on-disk content has since changed (e.g. after re-running a write
+# to the same version) — confirmed as a real reported bug: the version/
+# destination UI showed the new state correctly, but the canvas kept
+# showing the old image. The app already does its own smarter, path+frame
+# -keyed in-memory caching (see cacheRequest in the frontend) for scrub
+# performance, so disabling the browser's own opportunistic caching here
+# has no real cost.
+_NO_STORE_HEADERS = {"Cache-Control": "no-store"}
+
 
 # group_files' regex matching over every file in a large folder is real
 # CPU work — offloading it keeps aiohttp's single-threaded event loop free
@@ -138,7 +149,7 @@ async def video(request):
 
     # FileResponse supports HTTP Range requests, which <video> needs for
     # seeking/scrubbing.
-    return web.FileResponse(source)
+    return web.FileResponse(source, headers=_NO_STORE_HEADERS)
 
 
 @routes.get("/vfx-write/video-info")
@@ -175,14 +186,14 @@ async def image(request):
 
     if is_web_displayable_image(source):
         # Raw passthrough — faster, and exact original quality (no re-encode).
-        return web.FileResponse(source)
+        return web.FileResponse(source, headers=_NO_STORE_HEADERS)
 
     try:
         png_bytes = await run_in_executor(full_image_png, source)
     except Exception as error:
         raise web.HTTPInternalServerError(text=str(error))
 
-    return web.Response(body=png_bytes, content_type="image/png")
+    return web.Response(body=png_bytes, content_type="image/png", headers=_NO_STORE_HEADERS)
 
 
 @routes.get("/vfx-write/thumbnail")
@@ -199,4 +210,4 @@ async def thumbnail(request):
     except Exception as error:
         raise web.HTTPInternalServerError(text=str(error))
 
-    return web.Response(body=png_bytes, content_type="image/png")
+    return web.Response(body=png_bytes, content_type="image/png", headers=_NO_STORE_HEADERS)
