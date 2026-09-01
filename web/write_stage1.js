@@ -636,6 +636,17 @@ function buildPreviewWidget(node) {
   const container = el("div", {
     width: "100%",
     height: "100%",
+    // A <video> element has a real intrinsic size even with no content
+    // loaded, which is why the video widget's wrapper correctly stretches
+    // to fill available space. This container's own content — the "No
+    // output written yet." placeholder text, or an <img> with no src yet
+    // — has NO intrinsic size at all, so without an explicit minHeight
+    // the wrapper collapses to fit that tiny text instead of stretching.
+    // Same fix already proven on ComfyUI-VFX-Read's own preview
+    // container, just never ported here — confirmed live as the actual
+    // cause of a freshly-created Write node's empty-state canvas showing
+    // as a thin strip instead of matching Read's own default height.
+    minHeight: `${PREVIEW_DEFAULT_H}px`,
     background: "#181818",
     border: "1px solid #333",
     borderRadius: "4px",
@@ -647,9 +658,17 @@ function buildPreviewWidget(node) {
   });
 
   const imgEl = document.createElement("img");
+  // width/height:100% (not max-width/max-height) — the thumbnail route
+  // deliberately caps images at 640x420, so the <img>'s own intrinsic
+  // size is small; max-width/max-height alone only stops it growing PAST
+  // the container, it doesn't stretch a smaller image UP to fill one
+  // that's bigger. Same fix already proven on Read's own preview <img>,
+  // just never ported here — confirmed live as the actual cause of a
+  // loaded image sitting small and centered instead of filling the node
+  // when resized taller. object-fit:contain still preserves aspect ratio.
   Object.assign(imgEl.style, {
-    maxWidth: "100%",
-    maxHeight: "100%",
+    width: "100%",
+    height: "100%",
     objectFit: "contain",
     display: "none",
   });
